@@ -752,65 +752,78 @@ func buildHomerVolumeMounts(config *DeploymentConfig) []corev1.VolumeMount {
 	}
 }
 
-// buildSidecarCommand creates the command for the config-sync sidecar container
+// buildSidecarCommand creates the command for the config-sync sidecar container.
+//
+// Statements are joined with newlines, not "&&", because a heredoc's closing
+// delimiter (e.g. "EOF") must be alone on its own line to be recognized - a
+// trailing "&& next-command" on that same line stops it from matching, so the
+// heredoc silently swallows the rest of the script as literal content instead
+// of terminating. Sequential newline-separated statements sidestep that trap;
+// steps that don't involve a heredoc still use "&&" internally where a hard
+// stop-on-failure matters.
 func buildSidecarCommand(config *DeploymentConfig) string {
-	// Initial setup: wait for Homer to initialize, then set up config and assets
-	cmd := "echo 'Waiting for Homer to initialize assets...' && sleep 10 && "
-
-	// Set up config.yml symlink
-	cmd += "ln -sf /config/config.yml /www/assets/config.yml && "
-	cmd += "echo 'Config symlink created' && "
+	lines := []string{
+		"echo 'Waiting for Homer to initialize assets...'",
+		"sleep 10",
+		"ln -sf /config/config.yml /www/assets/config.yml",
+		"echo 'Config symlink created'",
+	}
 
 	// Copy custom assets if ConfigMap is provided
 	if config != nil && config.AssetsConfigMapName != "" {
-		cmd += "echo 'Setting up custom assets...' && "
-		// Dynamically copy all files from custom-assets directory
-		cmd += "if [ -d /custom-assets ] && [ \"$(ls -A /custom-assets 2>/dev/null)\" ]; then " +
-			"cd /custom-assets && " +
-			"for file in *; do " +
-			"[ -f \"$file\" ] && cp \"$file\" /www/assets/ && echo \"Copied $file\" || true; " +
-			"done; " +
-			"cd /; fi && "
+		lines = append(lines,
+			"echo 'Setting up custom assets...'",
+			// Dynamically copy all files from custom-assets directory
+			"if [ -d /custom-assets ] && [ \"$(ls -A /custom-assets 2>/dev/null)\" ]; then "+
+				"cd /custom-assets && "+
+				"for file in *; do "+
+				"[ -f \"$file\" ] && cp \"$file\" /www/assets/ && echo \"Copied $file\" || true; "+
+				"done; "+
+				"cd /; fi",
+		)
 	}
 
 	// Add PWA manifest if provided
 	if config != nil && config.PWAManifest != "" {
-		escapedManifest := strings.ReplaceAll(config.PWAManifest, "'", "'\"'\"'")
-		cmd += "echo 'Creating PWA manifest...' && " +
-			"cat > /www/assets/manifest.json << 'EOF'\n" + escapedManifest + "\nEOF && "
+		lines = append(lines,
+			"echo 'Creating PWA manifest...'",
+			"cat > /www/assets/manifest.json << 'EOF'\n"+config.PWAManifest+"\nEOF",
+		)
 	}
 
 	// Install the offline-fallback Service Worker: write sw.js and
 	// offline.html, then patch index.html to register it.
 	if config != nil && config.ServiceWorkerEnabled {
-		escapedSW := strings.ReplaceAll(config.ServiceWorkerJS, "'", "'\"'\"'")
-		escapedOffline := strings.ReplaceAll(config.OfflineHTML, "'", "'\"'\"'")
-		cmd += "echo 'Installing offline-fallback Service Worker...' && " +
-			"cat > /www/sw.js << 'EOF'\n" + escapedSW + "\nEOF && " +
-			"cat > /www/offline.html << 'EOF'\n" + escapedOffline + "\nEOF && " +
-			"if ! grep -q 'serviceWorker.register' /www/index.html 2>/dev/null; then " +
-			"sed -i 's#</body>#<script>if(\"serviceWorker\" in navigator){" +
-			"navigator.serviceWorker.register(\"/sw.js\");}</script></body>#' /www/index.html; " +
-			"fi && " +
-			"echo 'Service Worker installed' && "
+		lines = append(lines,
+			"echo 'Installing offline-fallback Service Worker...'",
+			"cat > /www/sw.js << 'EOF'\n"+config.ServiceWorkerJS+"\nEOF",
+			"cat > /www/offline.html << 'EOF'\n"+config.OfflineHTML+"\nEOF",
+			"if ! grep -q 'serviceWorker.register' /www/index.html 2>/dev/null; then "+
+				"sed -i 's#</body>#<script>if(\"serviceWorker\" in navigator){"+
+				"navigator.serviceWorker.register(\"/sw.js\");}</script></body>#' /www/index.html; "+
+				"fi",
+			"echo 'Service Worker installed'",
+		)
 	}
 
-	cmd += "echo 'Initial setup complete. Starting config watch...' && "
+	lines = append(lines, "echo 'Initial setup complete. Starting config watch...'")
 
 	// Watch for ConfigMap changes using polling approach - no package installation needed
-	cmd += "last_config_link='' && " +
-		"while true; do " +
-		"current_config_link=$(readlink /config/config.yml 2>/dev/null || echo 'none') && " +
-		"if [ \"$current_config_link\" != \"$last_config_link\" ]; then " +
-		"echo 'Config change detected, updating symlink...' && " +
-		"ln -sf /config/config.yml /www/assets/config.yml && " +
-		"echo \"Config updated at $(date)\" && " +
-		"last_config_link=\"$current_config_link\"; " +
-		"fi; " +
-		"sleep 5; " +
-		"done"
+	lines = append(lines,
+		"last_config_link=''",
+		"while true; do "+
+			"current_config_link=$(readlink /config/config.yml 2>/dev/null || echo 'none') && "+
+			"if [ \"$current_config_link\" != \"$last_config_link\" ]; then "+
+			"echo 'Config change detected, updating symlink...' && "+
+			"ln -sf /config/config.yml /www/assets/config.yml && "+
+			"echo \"Config updated at $(date)\" && "+
+			"last_config_link=\"$current_config_link\"; "+
+			"fi; "+
+			"sleep 5; "+
+			"done",
+	)
 
-	return cmd
+	return strings.Join(lines, "\n")
 }
 
 // buildSidecarVolumeMounts creates volume mounts for the config-sync sidecar
