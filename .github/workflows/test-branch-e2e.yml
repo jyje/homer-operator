@@ -73,6 +73,7 @@ jobs:
             homerConfig:
               title: "E2E Dashboard"
               subtitle: "kind e2e test"
+              header: true
             assets:
               serviceWorker:
                 enabled: true
