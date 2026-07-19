@@ -463,6 +463,17 @@ func (r *DashboardReconciler) buildDeploymentConfig(dashboard *homerv1alpha1.Das
 		deploymentConfig.AssetsConfigMapName = dashboard.Spec.Assets.ConfigMapRef.Name
 	}
 
+	if dashboard.Spec.Assets != nil && dashboard.Spec.Assets.ServiceWorker != nil && dashboard.Spec.Assets.ServiceWorker.Enabled {
+		sw := dashboard.Spec.Assets.ServiceWorker
+		offlineHTML := sw.OfflineHTML
+		if offlineHTML == "" {
+			offlineHTML = r.generateOfflineHTML(dashboard)
+		}
+		deploymentConfig.ServiceWorkerEnabled = true
+		deploymentConfig.OfflineHTML = offlineHTML
+		deploymentConfig.ServiceWorkerJS = homer.GenerateServiceWorkerJS(offlineHTML, sw.CacheAssets)
+	}
+
 	if dashboard.Spec.DNSPolicy != "" {
 		deploymentConfig.DNSPolicy = dashboard.Spec.DNSPolicy
 	}
@@ -1161,6 +1172,30 @@ func (r *DashboardReconciler) generatePWAManifest(dashboard *homerv1alpha1.Dashb
 
 	// Generate PWA manifest
 	return homer.GeneratePWAManifest(name, shortName, description, themeColor, backgroundColor, display, startURL, icons)
+}
+
+// generateOfflineHTML generates a default offline-fallback page from the
+// Dashboard's title/logo/theme colors, reusing fields already carried by
+// HomerConfig.
+func (r *DashboardReconciler) generateOfflineHTML(dashboard *homerv1alpha1.Dashboard) string {
+	title := dashboard.Spec.HomerConfig.Title
+	if title == "" {
+		title = dashboard.Name
+	}
+
+	logo := dashboard.Spec.HomerConfig.Logo
+
+	themeColor := dashboard.Spec.HomerConfig.Colors.Dark.HighlightPrimary
+	if themeColor == "" {
+		themeColor = dashboard.Spec.HomerConfig.Colors.Light.HighlightPrimary
+	}
+
+	backgroundColor := dashboard.Spec.HomerConfig.Colors.Dark.Background
+	if backgroundColor == "" {
+		backgroundColor = dashboard.Spec.HomerConfig.Colors.Light.Background
+	}
+
+	return homer.GenerateOfflineHTML(title, logo, themeColor, backgroundColor)
 }
 
 // getExternalHomerConfig retrieves Homer configuration from an external ConfigMap

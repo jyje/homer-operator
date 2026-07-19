@@ -1,0 +1,110 @@
+name: Test Branch E2E
+
+on:
+  push:
+    branches:
+      - test
+
+env:
+  KIND_CLUSTER: homer-operator-e2e
+  NAMESPACE: homer-operator-system
+  DASHBOARD_NAMESPACE: public
+  IMG: homer-operator:e2e
+
+jobs:
+  e2e:
+    name: Kind E2E (Helm install)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build operator image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ${{ env.IMG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER }}
+
+      - name: Load image into kind
+        run: kind load docker-image ${{ env.IMG }} --name ${{ env.KIND_CLUSTER }}
+
+      - name: Install chart (CRDs + operator)
+        run: |
+          helm install homer-operator charts/homer-operator \
+            --namespace ${{ env.NAMESPACE }} \
+            --create-namespace \
+            --set image.repository=homer-operator \
+            --set image.tag=e2e \
+            --set image.pullPolicy=Never \
+            --wait --timeout 120s
+
+      - name: Wait for operator rollout
+        run: |
+          kubectl rollout status deployment/homer-operator \
+            -n ${{ env.NAMESPACE }} --timeout=120s
+
+      - name: Deploy sample Dashboard (Service Worker enabled)
+        run: |
+          kubectl create namespace ${{ env.DASHBOARD_NAMESPACE }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: homer.rajsingh.info/v1alpha1
+          kind: Dashboard
+          metadata:
+            name: e2e-dashboard
+            namespace: public
+          spec:
+            replicas: 1
+            homerConfig:
+              title: "E2E Dashboard"
+              subtitle: "kind e2e test"
+            assets:
+              serviceWorker:
+                enabled: true
+          EOF
+
+      - name: Wait for Dashboard resources
+        run: |
+          kubectl wait --for=condition=Available deployment/e2e-dashboard-homer \
+            -n ${{ env.DASHBOARD_NAMESPACE }} --timeout=120s
+          kubectl get configmap,service,deployment -n ${{ env.DASHBOARD_NAMESPACE }} -l dashboard.homer.rajsingh.info/name=e2e-dashboard
+
+      - name: Verify offline-fallback assets are served
+        run: |
+          pod=$(kubectl get pod -n ${{ env.DASHBOARD_NAMESPACE }} \
+            -l dashboard.homer.rajsingh.info/name=e2e-dashboard \
+            -o jsonpath='{.items[0].metadata.name}')
+          for i in $(seq 1 20); do
+            if kubectl exec -n ${{ env.DASHBOARD_NAMESPACE }} "$pod" -c e2e-dashboard -- \
+                sh -c 'test -f /www/sw.js && test -f /www/offline.html && grep -q serviceWorker.register /www/index.html'; then
+              echo "Service Worker assets present"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::sw.js/offline.html/index.html registration not found in time"
+          exit 1
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl describe pods -n ${{ env.NAMESPACE }} || true
+          kubectl describe pods -n ${{ env.DASHBOARD_NAMESPACE }} || true
+          kubectl logs -n ${{ env.NAMESPACE }} -l app.kubernetes.io/name=homer-operator --tail=-1 || true
+          kubectl logs -n ${{ env.DASHBOARD_NAMESPACE }} -l dashboard.homer.rajsingh.info/name=e2e-dashboard --all-containers --tail=-1 || true

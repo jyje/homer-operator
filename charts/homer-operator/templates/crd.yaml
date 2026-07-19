@@ -131,6 +131,29 @@ spec:
                         description: ThemeColor defines the theme color
                         type: string
                     type: object
+                  serviceWorker:
+                    description: ServiceWorker configures an offline-fallback Service
+                      Worker
+                    properties:
+                      cacheAssets:
+                        description: |-
+                          CacheAssets are additional same-origin paths to precache alongside the
+                          offline page (e.g. a logo, a webfont) so the fallback page renders
+                          fully offline, not just as bare text.
+                        items:
+                          type: string
+                        type: array
+                      enabled:
+                        description: Enabled controls whether the offline-fallback
+                          Service Worker is installed
+                        type: boolean
+                      offlineHtml:
+                        description: |-
+                          OfflineHTML is inline HTML for the offline fallback page. If empty, a
+                          default page is generated from the Dashboard's title/logo/theme colors
+                          (same fields PWAConfig and HomerConfig.Colors already carry).
+                        type: string
+                    type: object
                 type: object
               configMap:
                 description: ConfigMap is where you want said homer configuration

@@ -248,6 +248,8 @@ type AssetsConfig struct {
 	Icons *IconConfig `json:"icons,omitempty"`
 	// PWA configures Progressive Web App manifest generation
 	PWA *PWAConfig `json:"pwa,omitempty"`
+	// ServiceWorker configures an offline-fallback Service Worker
+	ServiceWorker *ServiceWorkerConfig `json:"serviceWorker,omitempty"`
 }
 
 // AssetConfigMapRef references a ConfigMap containing custom assets
@@ -290,6 +292,20 @@ type PWAConfig struct {
 	Display string `json:"display,omitempty"`
 	// StartURL is the start URL for the PWA
 	StartURL string `json:"startUrl,omitempty"`
+}
+
+// ServiceWorkerConfig defines offline-fallback Service Worker configuration
+type ServiceWorkerConfig struct {
+	// Enabled controls whether the offline-fallback Service Worker is installed
+	Enabled bool `json:"enabled,omitempty"`
+	// OfflineHTML is inline HTML for the offline fallback page. If empty, a
+	// default page is generated from the Dashboard's title/logo/theme colors
+	// (same fields PWAConfig and HomerConfig.Colors already carry).
+	OfflineHTML string `json:"offlineHtml,omitempty"`
+	// CacheAssets are additional same-origin paths to precache alongside the
+	// offline page (e.g. a logo, a webfont) so the fallback page renders
+	// fully offline, not just as bare text.
+	CacheAssets []string `json:"cacheAssets,omitempty"`
 }
 
 // SecretKeyRef references a key in a Secret

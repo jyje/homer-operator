@@ -4,6 +4,8 @@ package homer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -453,6 +455,12 @@ type DeploymentConfig struct {
 	DNSConfig           string
 	Resources           *corev1.ResourceRequirements
 	HomerImage          string
+	// ServiceWorkerEnabled activates the offline-fallback Service Worker pipeline
+	ServiceWorkerEnabled bool
+	// ServiceWorkerJS is the generated sw.js content
+	ServiceWorkerJS string
+	// OfflineHTML is the generated/user-provided offline.html content
+	OfflineHTML string
 }
 
 func CreateDeployment(
@@ -494,6 +502,17 @@ func createDeploymentInternal(
 				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		},
+	}
+
+	// ServiceWorker support needs write access to the whole /www directory
+	// (index.html, sw.js, offline.html), not just /www/assets.
+	if config.ServiceWorkerEnabled {
+		volumes = append(volumes, corev1.Volume{
+			Name: "www-volume",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		})
 	}
 
 	// Add custom assets ConfigMap volume if provided
@@ -543,7 +562,7 @@ func createDeploymentInternal(
 							Type: corev1.SeccompProfileTypeRuntimeDefault,
 						},
 					},
-					InitContainers: []corev1.Container{},
+					InitContainers: buildInitContainers(config, image),
 					Containers: []corev1.Container{
 						{
 							Name:  "config-sync",
@@ -592,16 +611,7 @@ func createDeploymentInternal(
 									Type: corev1.SeccompProfileTypeRuntimeDefault,
 								},
 							},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "assets-volume",
-									MountPath: "/www/assets",
-								},
-								{
-									Name:      "config-volume",
-									MountPath: "/config",
-								},
-							},
+							VolumeMounts: buildHomerVolumeMounts(config),
 							Ports: []corev1.ContainerPort{
 								{
 									ContainerPort: DefaultHomerPort,
@@ -669,6 +679,79 @@ func getContainerResources(config *DeploymentConfig) corev1.ResourceRequirements
 	}
 }
 
+// buildInitContainers builds the Pod's init containers. When ServiceWorker
+// support is enabled, it seeds www-volume with a writable copy of the Homer
+// image's baked-in /www directory, so the pipeline can patch index.html and
+// add sw.js/offline.html without depending on that image's internal layout.
+func buildInitContainers(config *DeploymentConfig, image string) []corev1.Container {
+	if config == nil || !config.ServiceWorkerEnabled {
+		return []corev1.Container{}
+	}
+
+	return []corev1.Container{
+		{
+			Name:    "www-seed",
+			Image:   image,
+			Command: []string{"sh", "-c", "cp -a /www/. /shared-www/"},
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: &[]bool{false}[0],
+				RunAsNonRoot:             &[]bool{true}[0],
+				RunAsUser:                &[]int64{DefaultContainerUID}[0],
+				RunAsGroup:               &[]int64{DefaultContainerGID}[0],
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+				},
+				SeccompProfile: &corev1.SeccompProfile{
+					Type: corev1.SeccompProfileTypeRuntimeDefault,
+				},
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "www-volume",
+					MountPath: "/shared-www",
+				},
+			},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("5m"),
+					corev1.ResourceMemory: resource.MustParse("16Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("50m"),
+					corev1.ResourceMemory: resource.MustParse("64Mi"),
+				},
+			},
+		},
+	}
+}
+
+// buildHomerVolumeMounts builds the volume mounts for the main homer container.
+func buildHomerVolumeMounts(config *DeploymentConfig) []corev1.VolumeMount {
+	if config != nil && config.ServiceWorkerEnabled {
+		return []corev1.VolumeMount{
+			{
+				Name:      "www-volume",
+				MountPath: "/www",
+			},
+			{
+				Name:      "config-volume",
+				MountPath: "/config",
+			},
+		}
+	}
+
+	return []corev1.VolumeMount{
+		{
+			Name:      "assets-volume",
+			MountPath: "/www/assets",
+		},
+		{
+			Name:      "config-volume",
+			MountPath: "/config",
+		},
+	}
+}
+
 // buildSidecarCommand creates the command for the config-sync sidecar container
 func buildSidecarCommand(config *DeploymentConfig) string {
 	// Initial setup: wait for Homer to initialize, then set up config and assets
@@ -697,6 +780,21 @@ func buildSidecarCommand(config *DeploymentConfig) string {
 			"cat > /www/assets/manifest.json << 'EOF'\n" + escapedManifest + "\nEOF && "
 	}
 
+	// Install the offline-fallback Service Worker: write sw.js and
+	// offline.html, then patch index.html to register it.
+	if config != nil && config.ServiceWorkerEnabled {
+		escapedSW := strings.ReplaceAll(config.ServiceWorkerJS, "'", "'\"'\"'")
+		escapedOffline := strings.ReplaceAll(config.OfflineHTML, "'", "'\"'\"'")
+		cmd += "echo 'Installing offline-fallback Service Worker...' && " +
+			"cat > /www/sw.js << 'EOF'\n" + escapedSW + "\nEOF && " +
+			"cat > /www/offline.html << 'EOF'\n" + escapedOffline + "\nEOF && " +
+			"if ! grep -q 'serviceWorker.register' /www/index.html 2>/dev/null; then " +
+			"sed -i 's#</body>#<script>if(\"serviceWorker\" in navigator){" +
+			"navigator.serviceWorker.register(\"/sw.js\");}</script></body>#' /www/index.html; " +
+			"fi && " +
+			"echo 'Service Worker installed' && "
+	}
+
 	cmd += "echo 'Initial setup complete. Starting config watch...' && "
 
 	// Watch for ConfigMap changes using polling approach - no package installation needed
@@ -722,10 +820,22 @@ func buildSidecarVolumeMounts(config *DeploymentConfig) []corev1.VolumeMount {
 			Name:      "config-volume",
 			MountPath: "/config",
 		},
-		{
+	}
+
+	// With ServiceWorker support, config-sync needs write access to the
+	// whole /www directory (index.html, sw.js, offline.html), not just
+	// /www/assets, so it mounts the shared www-volume at /www instead of
+	// the plain assets-volume at /www/assets.
+	if config != nil && config.ServiceWorkerEnabled {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      "www-volume",
+			MountPath: "/www",
+		})
+	} else {
+		mounts = append(mounts, corev1.VolumeMount{
 			Name:      "assets-volume",
 			MountPath: "/www/assets",
-		},
+		})
 	}
 
 	// Add custom assets mount if configured
@@ -1033,6 +1143,93 @@ func GeneratePWAManifest(
 }`
 
 	return manifest
+}
+
+// GenerateOfflineHTML generates a default offline-fallback page from Dashboard
+// title/logo/theme colors, matching the style of GeneratePWAManifest.
+func GenerateOfflineHTML(title, logo, themeColor, backgroundColor string) string {
+	if title == "" {
+		title = "Dashboard"
+	}
+	if themeColor == "" {
+		themeColor = "#3367d6"
+	}
+	if backgroundColor == "" {
+		backgroundColor = "#ffffff"
+	}
+
+	logoHTML := ""
+	if logo != "" {
+		logoHTML = fmt.Sprintf(`<img src="%s" alt="%s" class="logo">`, logo, title)
+	}
+
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>%s - Offline</title>
+<style>
+  body {
+    margin: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    background: %s;
+    color: %s;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    text-align: center;
+  }
+  .logo { max-width: 96px; max-height: 96px; margin-bottom: 1rem; }
+  h1 { margin: 0 0 0.5rem; }
+  p { opacity: 0.8; }
+</style>
+</head>
+<body>
+<div>
+%s
+<h1>%s is offline</h1>
+<p>The dashboard couldn't be reached. Check your connection and try again.</p>
+</div>
+</body>
+</html>`, title, backgroundColor, themeColor, logoHTML, title)
+}
+
+// GenerateServiceWorkerJS generates a minimal network-first-with-offline-fallback
+// Service Worker scoped to "/", precaching the offline page and any additional
+// same-origin CacheAssets. The cache name is derived from a hash of offlineHTML
+// so returning users don't get a stale cached fallback after content changes.
+func GenerateServiceWorkerJS(offlineHTML string, cacheAssets []string) string {
+	sum := sha256.Sum256([]byte(offlineHTML))
+	cacheSuffix := hex.EncodeToString(sum[:])[:8]
+
+	precache := []string{`'/offline.html'`}
+	for _, asset := range cacheAssets {
+		precache = append(precache, fmt.Sprintf("'%s'", asset))
+	}
+
+	return fmt.Sprintf(`const CACHE = 'homer-offline-%s';
+const OFFLINE_URL = '/offline.html';
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE).then((cache) => cache.addAll([%s]))
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
+self.addEventListener('fetch', (event) => {
+  if (event.request.mode !== 'navigate') return;
+  event.respondWith(
+    fetch(event.request).catch(() => caches.match(OFFLINE_URL))
+  );
+});
+`, cacheSuffix, strings.Join(precache, ", "))
 }
 
 // truncateString truncates a string to a maximum length
